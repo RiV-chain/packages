@@ -1,0 +1,110 @@
+#!/bin/sh
+
+rivConfig="/etc/config/riv-mesh"
+
+first_boot_genConfig()
+{
+  . /usr/share/libubox/jshn.sh
+  boardcfg=$(ubus call system board)
+  touch ${rivConfig}
+  mesh -genconf -json | rivuci set
+
+  json_load "$boardcfg"
+  json_get_var kernel     kernel
+  json_get_var system     system
+  json_get_var model      model
+  json_get_var board_name board_name
+  nodeinfo='{"kernel": "'$kernel'", "hostname":"'OpenWrt'", "system": "'$system'", "model": "'$model'", "board_name": "'$board_name'"}'
+
+  uci set riv-mesh.riv-mesh.IfName="riv0"
+  uci set riv-mesh.riv-mesh.NodeInfo="$nodeinfo"
+  uci commit riv-mesh
+}
+
+if [ -e /etc/mesh.conf ]; then
+  echo "config: import config from /etc/mesh.conf to /etc/config/mesh" | logger -t mesh
+  touch ${rivConfig}
+  cat /etc/mesh.conf | rivuci set
+  mv /etc/mesh.conf /etc/mesh.conf.bak 
+elif [ ! -e ${rivConfig} ]; then
+  echo "first_boot: adding system board details to NodeInfo[] in NEW config: ${rivConfig}" | logger -t mesh
+
+  first_boot_genConfig
+
+  # create the network interface
+  uci -q batch <<-EOF >/dev/null
+    set network.riv-mesh=interface
+    set network.riv-mesh.device=riv0
+    set network.riv-mesh.proto=none
+EOF
+
+  # create the firewall zone
+  uci -q batch <<-EOF >/dev/null
+    set firewall.riv-mesh=zone
+    set firewall.riv-mesh.name=riv-mesh
+    add_list firewall.riv-mesh.network=riv-mesh
+    set firewall.riv-mesh.input=REJECT
+    set firewall.riv-mesh.output=ACCEPT
+    set firewall.riv-mesh.forward=REJECT
+    set firewall.riv-mesh.conntrack=1
+EOF
+
+  # allow ICMP from RiV-mesh zone, e.g. ping6
+  uci -q batch <<-EOF >/dev/null
+    add firewall rule
+    set firewall.@rule[-1].name='Allow-ICMPv6-riv-mesh'
+    set firewall.@rule[-1].src=riv-mesh
+    set firewall.@rule[-1].proto=icmp
+    add_list firewall.@rule[-1].icmp_type=echo-request
+    add_list firewall.@rule[-1].icmp_type=echo-reply
+    add_list firewall.@rule[-1].icmp_type=destination-unreachable
+    add_list firewall.@rule[-1].icmp_type=packet-too-big
+    add_list firewall.@rule[-1].icmp_type=time-exceeded
+    add_list firewall.@rule[-1].icmp_type=bad-header
+    add_list firewall.@rule[-1].icmp_type=unknown-header-type
+    set firewall.@rule[-1].limit='1000/sec'
+    set firewall.@rule[-1].family=ipv6
+    set firewall.@rule[-1].target=ACCEPT
+EOF
+
+  # allow SSH from RiV-mesh zone, needs to be explicitly enabled
+  uci -q batch <<-EOF >/dev/null
+    add firewall rule
+    set firewall.@rule[-1].enabled=0
+    set firewall.@rule[-1].name='Allow-SSH-riv-mesh'
+    set firewall.@rule[-1].src=riv-mesh
+    set firewall.@rule[-1].proto=tcp
+    set firewall.@rule[-1].dest_port=22
+    set firewall.@rule[-1].target=ACCEPT
+EOF
+
+  # allow LuCI access from RiV-mesh zone, needs to be explicitly enabled
+  uci -q batch <<-EOF >/dev/null
+    add firewall rule
+    set firewall.@rule[-1].enabled=0
+    set firewall.@rule[-1].name='Allow-HTTP-riv-mesh'
+    set firewall.@rule[-1].src=riv-mesh
+    set firewall.@rule[-1].proto=tcp
+    set firewall.@rule[-1].dest_port=80
+    set firewall.@rule[-1].target=ACCEPT
+EOF
+
+  # allow LuCI access with SSL from RiV-mesh zone, needs to be explicitly enabled
+  uci -q batch <<-EOF >/dev/null
+    add firewall rule
+    set firewall.@rule[-1].enabled=0
+    set firewall.@rule[-1].name='Allow-HTTPS-riv-mesh'
+    set firewall.@rule[-1].src=riv-mesh
+    set firewall.@rule[-1].proto=tcp
+    set firewall.@rule[-1].dest_port=443
+    set firewall.@rule[-1].target=ACCEPT
+EOF
+
+  uci commit firewall
+  uci commit network
+
+else
+  :
+fi
+
+exit 0

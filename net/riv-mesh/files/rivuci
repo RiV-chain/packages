@@ -1,0 +1,153 @@
+#!/usr/bin/env lua
+
+dkjson = require("dkjson")
+uci	= require("uci")
+
+UCI = {}
+
+--- Return the configuration defaults as a table suitable for JSON output
+--
+-- Mostly taken from mesh -genconf -json
+-- @return table with configuration defaults
+function UCI.defaults()
+	return { 
+		IfName = "riv0", 
+		NodeInfoPrivacy = false,
+		IfMTU = 65535,
+
+		Peers = { }, Listen = { }, MulticastInterfaces = { }, AllowedPublicKeys = { },
+		InterfacePeers = setmetatable({ }, {__jsontype = "object"}),
+		NodeInfo = setmetatable({ }, {__jsontype = "object"})
+	}
+end
+
+--- Return the RiV-mesh configuration as a table suitable for JSON output
+--
+-- @return table with RiV-mesh configuration
+function UCI.get()
+	local obj = UCI.defaults()
+
+	local cursor = uci.cursor()
+	local config = cursor:get_all("riv-mesh", "riv-mesh")
+	if not config then return obj end
+
+	obj.PublicKey = config.PublicKey
+	obj.PrivateKey = config.PrivateKey
+	obj.IfName = config.IfName or obj.IfName
+	obj.NodeInfo = dkjson.decode(config.NodeInfo) or obj.NodeInfo
+	for _, v in pairs({ "NodeInfoPrivacy" }) do
+		if config[v] ~= nil then obj[v] = to_bool(config[v]) end
+	end
+	if config["IfMTU"] ~= nil then obj["IfMTU"] = tonumber(config["IfMTU"]) end
+
+	cursor:foreach("riv-mesh", "peer", function (s) 
+		table.insert(obj.Peers, s.uri)
+	end)
+	cursor:foreach("riv-mesh", "listen_address", function (s) 
+		table.insert(obj.Listen, s.uri)
+	end)
+	cursor:foreach("riv-mesh", "multicast_interface", function (s) 
+		table.insert(obj.MulticastInterfaces, {
+			Beacon = to_bool(s.beacon), Listen = to_bool(s.listen),
+			Port = tonumber(s.port), Regex = s.regex
+		})
+	end)
+	cursor:foreach("riv-mesh", "allowed_public_key", function (s) 
+		table.insert(obj.AllowedPublicKeys, s.key)
+	end)
+
+	cursor:foreach("riv-mesh", "interface_peer", function (s) 
+		if obj.InterfacePeers[s.interface] == nil then
+			obj.InterfacePeers[s.interface] = {}
+		end
+		table.insert(obj.InterfacePeers[s["interface"]], s.uri)
+	end)
+
+	return obj
+end
+
+--- Parse and save updated configuration from JSON input
+--
+-- Transforms general settings into UCI sections, and replaces the UCI config's
+-- contents with them.
+-- @param table JSON input
+-- @return Boolean whether saving succeeded
+function UCI.set(obj)
+	local cursor = uci.cursor()
+
+	for i, section in pairs(cursor:get_all("riv-mesh")) do
+		cursor:delete("riv-mesh", section[".name"])
+	end
+
+
+	cursor:set("riv-mesh", "riv-mesh", "riv-mesh")
+	cursor:set("riv-mesh", "riv-mesh", "PublicKey", obj.PublicKey) 
+	cursor:set("riv-mesh", "riv-mesh", "PrivateKey", obj.PrivateKey) 
+	cursor:set("riv-mesh", "riv-mesh", "IfName", obj.IfName) 
+	cursor:set("riv-mesh", "riv-mesh", "NodeInfoPrivacy", to_int(obj.NodeInfoPrivacy)) 
+	cursor:set("riv-mesh", "riv-mesh", "NodeInfo", dkjson.encode(obj.NodeInfo)) 
+	cursor:set("riv-mesh", "riv-mesh", "IfMTU", obj.IfMTU)
+
+	set_values(cursor, "peer", "uri", obj.Peers)
+	set_values(cursor, "listen_address", "uri", obj.Listen)
+
+	for _, interface in pairs(obj.MulticastInterfaces) do
+		local name = cursor:add("riv-mesh", "multicast_interface")
+		cursor:set("riv-mesh", name, "beacon", to_int(interface.Beacon))
+		cursor:set("riv-mesh", name, "listen", to_int(interface.Listen))
+		cursor:set("riv-mesh", name, "port", interface.Port)
+		cursor:set("riv-mesh", name, "regex", interface.Regex)
+	end
+
+	set_values(cursor, "allowed_public_key", "key", obj.AllowedPublicKeys)
+
+	for interface, peers in pairs(obj.InterfacePeers) do
+		for _, v in pairs(peers) do
+			local name = cursor:add("riv-mesh", "interface_peer")
+			cursor:set("riv-mesh", name, "interface", interface)
+			cursor:set("riv-mesh", name, "uri", v)
+		end
+	end
+
+	return cursor:commit("riv-mesh")
+end
+
+function set_values(cursor, section_name, parameter, values) 
+	if values == nil then return false end
+
+	for k, v in pairs(values) do
+		local name = cursor:add("riv-mesh", section_name)
+		cursor:set("riv-mesh", name, parameter, v)
+	end
+end
+
+function to_int(bool) return bool and '1' or '0' end
+
+function to_bool(int) return int ~= '0' end
+
+function help()
+	print("JSON interface to /etc/config/riv-mesh\n\nExamples: \
+	rivuci get > /tmp/etc/mesh.conf \
+	cat /tmp/etc/mesh.conf | rivuci set \
+	uci changes \
+	rivuci get | mesh -useconf")
+end
+
+-- main 
+
+if arg[1] == "get" then
+	local json = dkjson.encode(UCI.get(), { indent = true })
+	print(json)
+elseif arg[1] == "set" then
+	local json = io.stdin:read("*a")
+	local obj, pos, err = dkjson.decode(json, 1, nil)
+
+	if obj then
+		UCI.set(obj)
+	else
+		print("dkjson: " .. err)
+		os.exit(1)
+	end
+else
+	help()
+end
